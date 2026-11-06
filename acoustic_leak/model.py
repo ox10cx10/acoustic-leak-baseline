@@ -5,6 +5,7 @@ from numbers import Integral, Real
 import warnings
 
 import numpy as np
+from sklearn.base import clone
 from sklearn.exceptions import ConvergenceWarning
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import confusion_matrix, roc_auc_score
@@ -12,11 +13,11 @@ from sklearn.model_selection import StratifiedGroupKFold
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-from .features import AcousticFeatures
+from .features import AcousticFeatures, FEATURE_NAMES, extract_features
 
 
 def make_pipeline(C: float = 1.0) -> Pipeline:
-    """Build an unfitted waveform-to-classifier pipeline; 1 denotes a leak."""
+    """Build a classifier for one-second waveforms. Class 1 denotes a leak."""
     if isinstance(C, (bool, np.bool_)) or not isinstance(C, Real) or not np.isfinite(C) or C <= 0:
         raise ValueError("C must be positive and finite")
     return Pipeline([
@@ -68,12 +69,9 @@ def evaluate(labels, scores, threshold: float = 0.5) -> dict:
 
 def cross_validate(signals, labels, groups, *, C: float = 1.0,
                    n_splits: int = 3, random_state: int = 0) -> dict:
-    """Return out-of-fold scores for one fixed C, never a fitted final model.
+    """Return out-of-fold scores, fold IDs and pooled metrics for a fixed C.
 
-    groups must identify original recordings or acquisition sources. All clips
-    from a group stay in one fold. The scaler is fitted inside each fold.
-    If these scores are used to choose C, they are model-selection evidence,
-    not an independent test result.
+    Clips sharing a group stay together. Each fold fits its own scaler and classifier.
     """
     signals = np.asarray(signals)
     if signals.ndim != 2 or len(signals) == 0:
@@ -88,23 +86,24 @@ def cross_validate(signals, labels, groups, *, C: float = 1.0,
         raise ValueError("n_splits must be an integer of at least two")
     if len(np.unique(groups)) < n_splits:
         raise ValueError("There must be at least n_splits distinct groups")
-    # Check the full input before starting any fit.
-    AcousticFeatures().fit(signals)
-    make_pipeline(C)
+    scaler_and_classifier = make_pipeline(C)[1:]
     splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
     splits = list(splitter.split(signals, labels, groups))
-    for train, valid in splits:
+    features = np.empty((len(labels), len(FEATURE_NAMES)))
+    fold_ids = np.empty(len(labels), dtype=int)
+    for fold, (train, valid) in enumerate(splits):
         if len(np.unique(labels[train])) != 2 or len(np.unique(labels[valid])) != 2:
-            raise ValueError("Every training and validation fold must contain both classes; revise the grouping or fold count")
+            raise ValueError("Each training and validation fold must contain both classes")
         if np.intersect1d(groups[train], groups[valid]).size:
             raise ValueError("Training and validation groups overlap")
-    scores = np.full(len(labels), np.nan)
-    fold_ids = np.full(len(labels), -1, dtype=int)
+        # Each clip occurs in one validation fold. Its acoustic features depend only on that clip.
+        features[valid], _ = extract_features(signals[valid])
+        fold_ids[valid] = fold
+    scores = np.empty(len(labels))
     with warnings.catch_warnings():
         warnings.simplefilter("error", ConvergenceWarning)
         warnings.filterwarnings("error", message="Line Search failed")
-        for fold, (train, valid) in enumerate(splits):
-            model = make_pipeline(C).fit(signals[train], labels[train])
-            scores[valid] = model.predict_proba(signals[valid])[:, 1]
-            fold_ids[valid] = fold
+        for train, valid in splits:
+            model = clone(scaler_and_classifier).fit(features[train], labels[train])
+            scores[valid] = model.predict_proba(features[valid])[:, 1]
     return {"scores": scores, "folds": fold_ids, "metrics": evaluate(labels, scores)}

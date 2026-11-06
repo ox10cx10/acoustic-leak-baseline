@@ -1,4 +1,4 @@
-"""Run the pipeline on simulated recordings; this is not leak-detection evidence."""
+"""Train and evaluate the baseline on simulated recording groups."""
 
 import numpy as np
 
@@ -31,8 +31,8 @@ def make_signals(n_groups=12, clips_per_group=4, seed=7):
 def main():
     signals, labels, groups = make_signals()
     result = cross_validate(signals, labels, groups, C=0.1)
-    print("Synthetic demonstration only; these scores do not measure real leak detection.")
-    print("Rows: true class; columns: predicted class. Class order: [0, 1].")
+    print(f"Grouped validation on {len(labels)} simulated clips")
+    print("Confusion matrix (rows: true, columns: predicted, order: non-leak, leak)")
     print(np.asarray(result["metrics"]["confusion_matrix"]))
     for key in ("accuracy", "leak_recall", "false_positive_rate"):
         print(f"{key}: {result['metrics'][key]:.3f}")

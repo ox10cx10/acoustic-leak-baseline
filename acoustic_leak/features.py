@@ -44,7 +44,7 @@ def _validate(signals: np.ndarray, sample_rate: float) -> np.ndarray:
         or not isinstance(sample_rate, Real)
         or sample_rate != SAMPLE_RATE
     ):
-        raise ValueError("Input must be sampled at 8192 Hz; resampling is not automatic")
+        raise ValueError("Expected a sample rate of 8192 Hz")
     signals = np.asarray(signals)
     if signals.ndim != 2 or signals.shape[0] == 0 or signals.shape[1] != N_SAMPLES:
         raise ValueError("Input must have shape (n_recordings, 8192), with at least one recording")
@@ -69,8 +69,7 @@ def _normalize(signals: np.ndarray) -> np.ndarray:
     return scaled / np.sqrt(np.mean(scaled**2, axis=1, keepdims=True))
 
 
-def _global_features(signals: np.ndarray) -> np.ndarray:
-    centered = signals - signals.mean(axis=1, keepdims=True)
+def _global_features(centered: np.ndarray) -> np.ndarray:
     rms = np.sqrt(np.mean(centered * centered, axis=1))
     peak = np.max(np.abs(centered), axis=1)
     crest = peak / np.maximum(rms, _TINY)
@@ -99,8 +98,7 @@ def _global_features(signals: np.ndarray) -> np.ndarray:
     return np.column_stack(columns)
 
 
-def _frame_power(signals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    centered = signals - signals.mean(axis=1, keepdims=True)
+def _frame_power(centered: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     frequencies, _, spectrum = stft(
         centered, fs=SAMPLE_RATE, window="hann", nperseg=256, noverlap=128,
         nfft=256, detrend=False, return_onesided=True, boundary=None,
@@ -109,17 +107,16 @@ def _frame_power(signals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return frequencies, np.abs(spectrum) ** 2
 
 
-def _logmel_features(power: np.ndarray) -> np.ndarray:
-    frequencies = np.fft.rfftfreq(256, d=1.0 / SAMPLE_RATE)
-    mel_min = 2595.0 * np.log10(1.0 + np.asarray(20.0) / 700.0)
-    mel_max = 2595.0 * np.log10(1.0 + np.asarray(SAMPLE_RATE / 2.0) / 700.0)
+def _logmel_features(power: np.ndarray, frequencies: np.ndarray) -> np.ndarray:
+    mel_min = 2595.0 * np.log10(1.0 + 20.0 / 700.0)
+    mel_max = 2595.0 * np.log10(1.0 + SAMPLE_RATE / 2.0 / 700.0)
     mel_points = np.linspace(mel_min, mel_max, 34)
-    edges = 700.0 * (10.0 ** (np.asarray(mel_points) / 2595.0) - 1.0)
+    edges = 700.0 * (10.0 ** (mel_points / 2595.0) - 1.0)
     filters = np.zeros((32, frequencies.size), dtype=np.float64)
     for band in range(32):
         left, center, right = edges[band:band + 3]
-        rising = (frequencies - left) / max(center - left, np.finfo(float).eps)
-        falling = (right - frequencies) / max(right - center, np.finfo(float).eps)
+        rising = (frequencies - left) / (center - left)
+        falling = (right - frequencies) / (right - center)
         filters[band] = np.maximum(0.0, np.minimum(rising, falling))
         filters[band] /= filters[band].sum()
     mel_power = np.einsum("mf,nft->nmt", filters, power, optimize=True)
@@ -165,14 +162,14 @@ def extract_features(
 ) -> tuple[np.ndarray, list[str]]:
     """Extract 15 global, 64 log-Mel and 14 temporal descriptors per recording.
 
-    Input is a nonempty matrix of one-second recordings at 8192 Hz. Each row
-    is centered and RMS-normalized independently. The output has shape
-    (n_recordings, 93); no parameters are learned from other recordings.
+    Each row is a one-second waveform at 8192 Hz, normalized by its own RMS
+    after mean removal. Columns follow the order of the returned feature names.
     """
     normalized = _normalize(_validate(signals, sample_rate))
-    frequencies, power = _frame_power(normalized)
+    centered = normalized - normalized.mean(axis=1, keepdims=True)
+    frequencies, power = _frame_power(centered)
     features = np.column_stack([
-        _global_features(normalized), _logmel_features(power),
+        _global_features(centered), _logmel_features(power, frequencies),
         _dynamic_features(power, frequencies),
     ])
     if not np.isfinite(features).all():
@@ -181,12 +178,7 @@ def extract_features(
 
 
 class AcousticFeatures(TransformerMixin, BaseEstimator):
-    """Scikit-learn transformer for fixed-format acoustic recordings.
-
-    Fit validates the waveform format; feature extraction has no learned
-    statistics. Put a StandardScaler after this transformer in a Pipeline so
-    that scaling parameters are fitted only on the training partition.
-    """
+    """Transform one-second recordings into the 93 ordered acoustic features."""
 
     def __init__(self, sample_rate: float = SAMPLE_RATE):
         self.sample_rate = sample_rate
@@ -199,10 +191,7 @@ class AcousticFeatures(TransformerMixin, BaseEstimator):
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         check_is_fitted(self, "n_features_in_")
-        signals = _validate(X, self.sample_rate)
-        if signals.shape[1] != self.n_features_in_:
-            raise ValueError("Recording length must match the fitted waveform format")
-        return extract_features(signals, self.sample_rate)[0]
+        return extract_features(X, self.sample_rate)[0]
 
     def get_feature_names_out(self, input_features=None) -> np.ndarray:
         check_is_fitted(self, "n_features_in_")
